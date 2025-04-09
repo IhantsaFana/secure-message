@@ -70,21 +70,30 @@ def decrypt_private_key(encrypted_data_b64, password):
     return private_key  # bytes
 
 
-# Déchiffrement de la clé AES avec la clé privée RSA
-def decrypt_aes_key(encrypted_aes_key_b64, private_key_pem):
-    from cryptography.hazmat.primitives import serialization
 
-    # Charger la clé privée à partir de la clé PEM
+
+
+def decrypt_aes_key(encrypted_aes_key_b64: str, private_key_pem: str) -> bytes:
+    """
+    Déchiffre une clé AES chiffrée avec RSA-OAEP.
+
+    :param encrypted_aes_key_b64: Clé AES chiffrée et encodée en base64
+    :param private_key_pem: Clé privée RSA au format PEM (UTF-8 string)
+    :return: Clé AES déchiffrée (bytes)
+    """
+
+    # Charger la clé privée RSA
     private_key = serialization.load_pem_private_key(
-        private_key_pem,
-        password=None,  # On suppose que la clé est déjà déchiffrée
+        private_key_pem.encode("utf-8"),
+        password=None,  # Si la clé est protégée par mot de passe, ajouter ici
         backend=default_backend()
     )
 
+    # Décoder la clé AES chiffrée
     encrypted_aes_key = b64decode(encrypted_aes_key_b64)
 
-    # Déchiffrement de la clé AES avec la clé privée RSA
-    aes_key = private_key.decrypt(
+    # Déchiffrement RSA
+    decrypted_key = private_key.decrypt(
         encrypted_aes_key,
         padding.OAEP(
             mgf=padding.MGF1(algorithm=hashes.SHA256()),
@@ -92,4 +101,5 @@ def decrypt_aes_key(encrypted_aes_key_b64, private_key_pem):
             label=None
         )
     )
-    return aes_key
+
+    return decrypted_key  # bytes

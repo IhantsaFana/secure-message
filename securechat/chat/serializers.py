@@ -1,8 +1,8 @@
 from rest_framework import serializers
-from .models import Message
+from .models import EncryptedMessage
 
-class MessageSerializer(serializers.ModelSerializer):
+class EncryptedMessageSerializer(serializers.ModelSerializer):
     class Meta:
-        model = Message
-        fields = '__all__'
-        read_only_fields = ['sender']
+        model = EncryptedMessage
+        fields = ['id', 'sender', 'recipient', 'encrypted_message', 'encrypted_aes_key', 'iv', 'created_at']
+        read_only_fields = ['sender', 'created_at']

@@ -1,77 +1,117 @@
-from rest_framework import generics, permissions
-from .models import Message
-from .serializers import MessageSerializer
-from crypto.utils import encrypt_message
-from django.conf import settings
+import base64
+import os
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives import hashes
+from .models import EncryptedMessage
+from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
-from .models import Message
-from .serializers import MessageSerializer
-from users.utils import decrypt_aes_key
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import padding
+from django.contrib.auth import get_user_model
 
-class SendMessageView(generics.CreateAPIView):
-    serializer_class = MessageSerializer
-    permission_classes = [permissions.IsAuthenticated]
+User = get_user_model()
 
-    def perform_create(self, serializer):
-        plaintext = self.request.data.get("message")
-        aes_key = settings.SECRET_KEY[:32].encode()  # ⚠️ À remplacer par vraie clé AES dans la version finale
+class SendEncryptedMessage(APIView):
+    def post(self, request):
+        recipient_id = request.data.get('recipient')
+        message = request.data.get('message')
 
-        content_encrypted, iv, tag = encrypt_message(aes_key, plaintext)
-
-        serializer.save(
-            sender=self.request.user,
-            content_encrypted=content_encrypted,
-            iv=iv,
-            hmac=tag,
-        )
-
-class InboxView(generics.ListAPIView):
-    serializer_class = MessageSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        return Message.objects.filter(recipient=self.request.user).order_by('-timestamp')
-
-
-class DecryptMessageView(APIView):
-    permission_classes = [IsAuthenticated]
-
-    def get(self, request, message_id):
         try:
-            # Récupérer le message
-            message = Message.objects.get(id=message_id)
-            
-            # Assurer que l'utilisateur est bien le destinataire du message
-            if message.recipient != request.user:
-                return Response({"detail": "Vous n'êtes pas le destinataire de ce message."}, status=403)
+            recipient = User.objects.get(id=recipient_id)
+            recipient_public_key = serialization.load_pem_public_key(
+                recipient.public_key.encode()  # Assure-toi que ce champ existe et est bien une clé PEM
+            )
 
-            # Déchiffrer la clé AES
-            encrypted_aes_key_b64 = message.aes_key  # La clé AES chiffrée
-            private_key_pem = request.user.private_key  # La clé privée RSA de l'utilisateur
+            # Génère une clé AES aléatoire (256 bits)
+            aes_key = os.urandom(32)
 
-            aes_key = decrypt_aes_key(encrypted_aes_key_b64, private_key_pem)
+            # Génère un IV (Initialisation Vector)
+            iv = os.urandom(16)
 
-            # Déchiffrer le message avec la clé AES
-            iv = b64decode(message.iv)  # L'IV est nécessaire pour le déchiffrement
-            cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
-            decryptor = cipher.decryptor()
+            # Chiffre le message
+            cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv))
+            encryptor = cipher.encryptor()
 
-            # Déchiffrement du contenu du message
-            padded_message = decryptor.update(b64decode(message.content)) + decryptor.finalize()
+            # Padding du message à un multiple de 16 (CBC nécessite un bloc multiple)
+            from cryptography.hazmat.primitives import padding as sym_padding
+            padder = sym_padding.PKCS7(128).padder()
+            padded_data = padder.update(message.encode()) + padder.finalize()
 
-            # Suppression du padding PKCS7
-            unpadder = padding.PKCS7(128).unpadder()
-            decrypted_message = unpadder.update(padded_message) + unpadder.finalize()
+            encrypted_message = encryptor.update(padded_data) + encryptor.finalize()
 
-            return Response({
-                "message": decrypted_message.decode('utf-8')
-            })
+            # Chiffre la clé AES avec la clé publique du destinataire (RSA)
+            encrypted_aes_key = recipient_public_key.encrypt(
+                aes_key,
+                padding.OAEP(
+                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
+                )
+            )
 
-        except Message.DoesNotExist:
-            return Response({"detail": "Message non trouvé."}, status=404)
+            # Enregistre le message
+            EncryptedMessage.objects.create(
+                sender=request.user,
+                recipient=recipient,
+                encrypted_message=base64.b64encode(encrypted_message).decode(),
+                encrypted_aes_key=base64.b64encode(encrypted_aes_key).decode(),
+                iv=base64.b64encode(iv).decode(),
+            )
+
+            return Response({'status': 'Message sent & encrypted ✅'}, status=status.HTTP_201_CREATED)
+
+        except User.DoesNotExist:
+            return Response({'error': 'Recipient not found'}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
-            return Response({"detail": str(e)}, status=400)
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class ReadEncryptedMessages(APIView):
+    def get(self, request):
+        user = request.user
+
+        # Si on a stocké la clé privée déchiffrée (en mémoire ou dans la DB temporairement)
+        try:
+            private_key = serialization.load_pem_private_key(
+                user.decrypted_private_key.encode(),  # 🔐 doit être disponible en texte PEM
+                password=None,
+            )
+
+            messages = EncryptedMessage.objects.filter(recipient=user)
+            result = []
+
+            for msg in messages:
+                # Décodage base64
+                encrypted_aes_key = base64.b64decode(msg.encrypted_aes_key)
+                iv = base64.b64decode(msg.iv)
+                encrypted_message = base64.b64decode(msg.encrypted_message)
+
+                # 🔓 Déchiffre la clé AES avec la clé privée RSA
+                aes_key = private_key.decrypt(
+                    encrypted_aes_key,
+                    asym_padding.OAEP(
+                        mgf=asym_padding.MGF1(algorithm=hashes.SHA256()),
+                        algorithm=hashes.SHA256(),
+                        label=None
+                    )
+                )
+
+                # 🔓 Déchiffre le message AES
+                cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv))
+                decryptor = cipher.decryptor()
+                padded_plaintext = decryptor.update(encrypted_message) + decryptor.finalize()
+
+                # Retire le padding
+                unpadder = sym_padding.PKCS7(128).unpadder()
+                plaintext = unpadder.update(padded_plaintext) + unpadder.finalize()
+
+                result.append({
+                    'from': msg.sender.username,
+                    'message': plaintext.decode(),
+                    'received_at': msg.created_at
+                })
+
+            return Response(result, status=200)
+
+        except Exception as e:
+            return Response({'error': f'Erreur de déchiffrement : {str(e)}'}, status=500)
